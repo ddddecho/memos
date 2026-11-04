@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -404,4 +405,61 @@ func TestValidateURLCGNAT(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPostRetriesTransientFailures(t *testing.T) {
+	resetPrivateDestinationPolicy(t)
+	AllowPrivateIPs = true
+	previousBaseDelay := retryBaseDelay
+	retryBaseDelay = 2 * time.Millisecond
+	t.Cleanup(func() { retryBaseDelay = previousBaseDelay })
+
+	testCases := []struct {
+		name         string
+		statuses     []int
+		wantAttempts int32
+		wantErr      bool
+	}{
+		{name: "recovers after a 503", statuses: []int{503, 200}, wantAttempts: 2},
+		{name: "recovers after a 429", statuses: []int{429, 200}, wantAttempts: 2},
+		{name: "gives up after the last attempt", statuses: []int{500, 502, 503, 200}, wantAttempts: 3, wantErr: true},
+		{name: "does not retry a client error", statuses: []int{404, 200}, wantAttempts: 1, wantErr: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				require.JSONEq(t, `{"hello":"world"}`, string(body))
+				w.WriteHeader(tc.statuses[attempts.Add(1)-1])
+				_, _ = w.Write([]byte(`{"code":0}`))
+			}))
+			defer server.Close()
+
+			err := Post(&Request{URL: server.URL, Payload: map[string]string{"hello": "world"}})
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tc.wantAttempts, attempts.Load())
+		})
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	first := retryDelay(0, "")
+	require.GreaterOrEqual(t, first, retryBaseDelay)
+	require.Less(t, first, retryBaseDelay+retryBaseDelay/2)
+
+	second := retryDelay(1, "")
+	require.GreaterOrEqual(t, second, 2*retryBaseDelay)
+
+	honored := retryDelay(0, "10")
+	require.GreaterOrEqual(t, honored, 10*time.Second)
+	require.Less(t, honored, 15*time.Second)
+
+	unparsable := retryDelay(0, "Wed, 21 Oct 2026 07:28:00 GMT")
+	require.Less(t, unparsable, 2*retryBaseDelay)
 }
