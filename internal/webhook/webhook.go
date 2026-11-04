@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -35,8 +36,15 @@ var (
 		},
 	}
 
+	// retryBaseDelay is the backoff before the second delivery attempt. It
+	// doubles for each attempt after that.
+	retryBaseDelay = 2 * time.Second
+
 	asyncPostQueue = make(chan *Request, 128)
 )
+
+// maxDeliveryAttempts bounds how many times one delivery is tried.
+const maxDeliveryAttempts = 3
 
 func init() {
 	for range 4 {
@@ -138,15 +146,71 @@ func GenerateSigningSecret() (string, error) {
 }
 
 // Post delivers the request synchronously and returns the receiver's verdict.
+// Network errors, 429 and 5xx responses are retried with backoff up to
+// maxDeliveryAttempts; every other response is final.
 func Post(requestPayload *Request) error {
 	body, err := json.Marshal(requestPayload.Payload)
 	if err != nil {
 		return errors.Wrapf(err, "failed to marshal webhook request to %s", requestPayload.URL)
 	}
 
-	req, err := http.NewRequest("POST", requestPayload.URL, bytes.NewBuffer(body))
+	var lastErr error
+	for attempt := range maxDeliveryAttempts {
+		req, err := newDeliveryRequest(requestPayload, body)
+		if err != nil {
+			return err
+		}
+
+		resp, err := safeClient.Do(req)
+		if err != nil {
+			lastErr = errors.Wrapf(err, "failed to post webhook to %s", requestPayload.URL)
+			if attempt < maxDeliveryAttempts-1 {
+				time.Sleep(retryDelay(attempt, ""))
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return errors.Wrapf(err, "failed to read webhook response from %s", requestPayload.URL)
+		}
+
+		if isRetryableStatus(resp.StatusCode) {
+			lastErr = errors.Errorf("failed to post webhook %s, status code: %d", requestPayload.URL, resp.StatusCode)
+			if attempt < maxDeliveryAttempts-1 {
+				time.Sleep(retryDelay(attempt, resp.Header.Get("Retry-After")))
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return errors.Errorf("failed to post webhook %s, status code: %d", requestPayload.URL, resp.StatusCode)
+		}
+
+		response := &struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}{}
+		if err := json.Unmarshal(b, response); err != nil {
+			return errors.Wrapf(err, "failed to unmarshal webhook response from %s", requestPayload.URL)
+		}
+
+		if response.Code != 0 {
+			return errors.Errorf("receive error code sent by webhook server, code %d, msg: %s", response.Code, response.Message)
+		}
+
+		return nil
+	}
+	return lastErr
+}
+
+// newDeliveryRequest builds one delivery attempt. The signature covers the
+// timestamp, so each attempt is signed afresh and stays inside the receiver's
+// replay tolerance however long the backoff ran.
+func newDeliveryRequest(requestPayload *Request, body []byte) (*http.Request, error) {
+	req, err := http.NewRequest("POST", requestPayload.URL, bytes.NewReader(body))
 	if err != nil {
-		return errors.Wrapf(err, "failed to construct webhook request to %s", requestPayload.URL)
+		return nil, errors.Wrapf(err, "failed to construct webhook request to %s", requestPayload.URL)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -154,7 +218,7 @@ func Post(requestPayload *Request) error {
 	if requestPayload.SigningSecret != "" {
 		key, err := resolveSigningKey(requestPayload.SigningSecret)
 		if err != nil {
-			return errors.Wrapf(err, "failed to derive signing key for webhook to %s", requestPayload.URL)
+			return nil, errors.Wrapf(err, "failed to derive signing key for webhook to %s", requestPayload.URL)
 		}
 
 		msgID := "msg_" + uuid.NewV4().String()
@@ -169,35 +233,24 @@ func Post(requestPayload *Request) error {
 		req.Header.Set("webhook-timestamp", timestamp)
 		req.Header.Set("webhook-signature", "v1,"+signature)
 	}
+	return req, nil
+}
 
-	resp, err := safeClient.Do(req)
-	if err != nil {
-		return errors.Wrapf(err, "failed to post webhook to %s", requestPayload.URL)
+// isRetryableStatus reports whether a response status is worth another attempt.
+func isRetryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
+// retryDelay returns how long to wait before the attempt after the given one.
+// A Retry-After value of whole seconds takes precedence over the exponential
+// backoff, and half the delay again is added as jitter so receivers recovering
+// from an outage are not hit by every queued delivery at once.
+func retryDelay(attempt int, retryAfter string) time.Duration {
+	delay := retryBaseDelay << attempt
+	if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds >= 0 {
+		delay = time.Duration(seconds) * time.Second
 	}
-	defer resp.Body.Close()
-
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return errors.Wrapf(err, "failed to read webhook response from %s", requestPayload.URL)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return errors.Errorf("failed to post webhook %s, status code: %d", requestPayload.URL, resp.StatusCode)
-	}
-
-	response := &struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	}{}
-	if err := json.Unmarshal(b, response); err != nil {
-		return errors.Wrapf(err, "failed to unmarshal webhook response from %s", requestPayload.URL)
-	}
-
-	if response.Code != 0 {
-		return errors.Errorf("receive error code sent by webhook server, code %d, msg: %s", response.Code, response.Message)
-	}
-
-	return nil
+	return delay + mathrand.N(delay/2)
 }
 
 // PostAsync enqueues the request for bounded asynchronous delivery and does
