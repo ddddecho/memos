@@ -174,3 +174,11 @@ func mysqlMemoShareDeleteWhere(delete *store.DeleteMemoShare) ([]string, []any) 
 	}
 	return where, args
 }
+
+func (d *DB) DeleteExpiredMemoShares(ctx context.Context, before int64) (int64, error) {
+	result, err := d.db.ExecContext(ctx, "DELETE FROM `memo_share` WHERE `expires_ts` IS NOT NULL AND `expires_ts` < ?", before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
