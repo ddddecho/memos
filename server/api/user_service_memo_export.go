@@ -37,12 +37,13 @@ type memoExportData struct {
 // in the manifest; callers name the download after the same instant. Every
 // memo row the archive needs is loaded before the first byte is written, so a
 // failure loading them surfaces before the response is committed. Attachment
-// content is read while writing; a failure there truncates the archive.
-func (s *APIService) WriteMemoExport(ctx context.Context, user *store.User, w io.Writer, exportTime time.Time) error {
+// content is read while writing; a failure there truncates the archive. A
+// non-zero since limits the archive to memos added or edited after that time.
+func (s *APIService) WriteMemoExport(ctx context.Context, user *store.User, w io.Writer, exportTime, since time.Time) error {
 	if user == nil {
 		return errors.New("user is required")
 	}
-	export, err := s.loadMemoExportData(ctx, user)
+	export, err := s.loadMemoExportData(ctx, user, since)
 	if err != nil {
 		return err
 	}
@@ -73,10 +74,15 @@ func (s *APIService) WriteMemoExport(ctx context.Context, user *store.User, w io
 	return writer.Close()
 }
 
-func (s *APIService) loadMemoExportData(ctx context.Context, user *store.User) (*memoExportData, error) {
+func (s *APIService) loadMemoExportData(ctx context.Context, user *store.User, since time.Time) (*memoExportData, error) {
 	memos, err := s.Store.ListMemos(ctx, &store.FindMemo{CreatorID: &user.ID})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to list memos")
+	}
+	if !since.IsZero() {
+		memos = slices.DeleteFunc(memos, func(memo *store.Memo) bool {
+			return memo.CreatedTs <= since.Unix()
+		})
 	}
 	export := &memoExportData{
 		memos:           memos,

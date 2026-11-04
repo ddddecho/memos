@@ -139,7 +139,7 @@ func exportArchive(t *testing.T, ts *TestService, user *store.User) *memoexport.
 func exportArchiveBytes(t *testing.T, ts *TestService, user *store.User) []byte {
 	t.Helper()
 	var buffer bytes.Buffer
-	require.NoError(t, ts.Service.WriteMemoExport(context.Background(), user, &buffer, time.Now()))
+	require.NoError(t, ts.Service.WriteMemoExport(context.Background(), user, &buffer, time.Now(), time.Time{}))
 	return buffer.Bytes()
 }
 
@@ -222,6 +222,25 @@ func indexOfMemo(archive *memoexport.File, uid string) int {
 		}
 	}
 	return -1
+}
+
+func TestWriteMemoExportSince(t *testing.T) {
+	ts := NewTestService(t)
+	defer ts.Cleanup()
+	fixture := buildArchiveFixture(t, ts, "incremental")
+
+	var buffer bytes.Buffer
+	since := mustTime(t, "2026-03-01T00:00:00Z")
+	require.NoError(t, ts.Service.WriteMemoExport(context.Background(), fixture.user, &buffer, time.Now(), since))
+
+	file := readArchive(t, buffer.Bytes())
+	uids := make([]string, 0, len(file.Memos))
+	for _, memo := range file.Memos {
+		uids = append(uids, memo.UID)
+	}
+	require.Contains(t, uids, "parent00001")
+	require.NotContains(t, uids, "comment0001")
+	require.Equal(t, len(uids), file.Manifest.Counts.Memos)
 }
 
 func TestImportMemoExportIntoAnotherAccount(t *testing.T) {
