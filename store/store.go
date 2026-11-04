@@ -27,6 +27,7 @@ type Store struct {
 	instanceSettingCache *cache.Cache // cache for instance settings
 	userCache            *cache.Cache // cache for users
 	userSettingCache     *cache.Cache // cache for user settings
+	memoShareCache       *cache.Cache // cache for memo shares, keyed by token
 
 	// storageDriverCache reuses object-storage clients across requests, keyed
 	// by the resolved configuration. Reset whenever the STORAGE setting changes.
@@ -52,6 +53,7 @@ func New(driver Driver, profile *profile.Profile) *Store {
 		instanceSettingCache: cache.New(cacheConfig),
 		userCache:            cache.New(cacheConfig),
 		userSettingCache:     cache.New(cacheConfig),
+		memoShareCache:       cache.New(cacheConfig),
 	}
 
 	return store
@@ -71,6 +73,7 @@ func (s *Store) Close() error {
 	s.instanceSettingCache.Close()
 	s.userCache.Close()
 	s.userSettingCache.Close()
+	s.memoShareCache.Close()
 
 	return s.driver.Close()
 }
