@@ -146,9 +146,11 @@ type stubExporter struct {
 	started chan struct{}
 	release chan struct{}
 	err     error
+	since   time.Time
 }
 
-func (e *stubExporter) WriteMemoExport(ctx context.Context, _ *store.User, w io.Writer, _ time.Time) error {
+func (e *stubExporter) WriteMemoExport(ctx context.Context, _ *store.User, w io.Writer, _, since time.Time) error {
+	e.since = since
 	if e.err != nil {
 		return e.err
 	}
@@ -205,6 +207,35 @@ func TestServeMemoExport_FailureBeforeFirstByteIsAnErrorResponse(t *testing.T) {
 	// The lock is released after a failure.
 	f.fs.MemoExporter = f.svc
 	require.Equal(t, http.StatusOK, f.request(ctx, t, http.MethodGet, f.member.Username, f.admin).Code)
+}
+
+func TestServeMemoExport_Since(t *testing.T) {
+	ctx := context.Background()
+	f, cleanup := newMemoExportFixture(ctx, t)
+	defer cleanup()
+
+	exporter := &stubExporter{started: make(chan struct{}), release: make(chan struct{})}
+	close(exporter.release)
+	f.fs.MemoExporter = exporter
+
+	req := httptest.NewRequest(http.MethodGet, "/file/users/"+f.member.Username+"/export?since=2026-03-01T00:00:00Z", nil)
+	req.AddCookie(newRefreshTokenCookie(ctx, t, f.stores, f.admin.ID, f.svc.Secret))
+	recorder := httptest.NewRecorder()
+	f.mux.ServeHTTP(recorder, req)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, exporter.since.Equal(time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)))
+
+	invalid := httptest.NewRequest(http.MethodGet, "/file/users/"+f.member.Username+"/export?since=yesterday", nil)
+	invalid.AddCookie(newRefreshTokenCookie(ctx, t, f.stores, f.admin.ID, f.svc.Secret))
+	recorder = httptest.NewRecorder()
+	f.mux.ServeHTTP(recorder, invalid)
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+
+	// An invalid cutoff must not retain the export lock or consume budget.
+	f.fs.MemoExporter = f.svc
+	require.Equal(t, http.StatusOK, f.request(ctx, t, http.MethodGet, f.member.Username, f.admin).Code)
+	require.Equal(t, ratelimit.DefaultPolicy()[ratelimit.ScopeArchiveUser].Limit-2,
+		f.fs.RateLimiter.Allowed(ratelimit.ScopeArchiveUser, fmt.Sprint(f.admin.ID), 1).Remaining)
 }
 
 func TestServeMemoExport_RouteDisabledWithoutExporter(t *testing.T) {

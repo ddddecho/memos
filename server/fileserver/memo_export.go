@@ -25,13 +25,16 @@ const memoExportRoute = "/file/users/{identifier}/export"
 // implements it; the file server owns the HTTP side of an export so the
 // archive streams to the client instead of being held in memory.
 type MemoExporter interface {
-	WriteMemoExport(ctx context.Context, user *store.User, w io.Writer, exportTime time.Time) error
+	WriteMemoExport(ctx context.Context, user *store.User, w io.Writer, exportTime, since time.Time) error
 }
 
 // serveMemoExport streams a user's Memos export file to an instance
 // administrator. Only one export runs at a time; a second request is refused
 // with 429. HEAD runs every check and answers with the headers alone, so a
-// client can learn about a refusal before the browser starts a download.
+// client can learn about a refusal before the browser starts a download. The
+// optional since query parameter, an RFC 3339 time such as the exportTime of
+// an earlier archive, includes memos added or edited in or after that second.
+// Successive archives overlap that second; consumers deduplicate by memo UID.
 func (s *FileServerService) serveMemoExport(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	if s.MemoExporter == nil {
@@ -60,6 +63,10 @@ func (s *FileServerService) serveMemoExport(w http.ResponseWriter, r *http.Reque
 		return &httphandler.Error{Code: http.StatusNotFound, Message: "user not found"}
 	}
 
+	since, err := parseMemoExportSince(r)
+	if err != nil {
+		return &httphandler.Error{Code: http.StatusBadRequest, Message: "invalid since parameter", Cause: err}
+	}
 	preflight := r.Method == http.MethodHead
 	if err := s.admitMemoExport(w, caller, preflight); err != nil {
 		return err
@@ -77,7 +84,7 @@ func (s *FileServerService) serveMemoExport(w http.ResponseWriter, r *http.Reque
 	}
 
 	body := &commitOnWrite{ResponseWriter: w}
-	if err := s.MemoExporter.WriteMemoExport(ctx, user, body, exportTime); err != nil {
+	if err := s.MemoExporter.WriteMemoExport(ctx, user, body, exportTime, since); err != nil {
 		// Before the first byte this becomes a JSON 500, which the handler
 		// wrapper logs and strips the archive headers from. After it, the
 		// response is already committed and the client receives a truncated
@@ -88,6 +95,16 @@ func (s *FileServerService) serveMemoExport(w http.ResponseWriter, r *http.Reque
 		return &httphandler.Error{Code: http.StatusInternalServerError, Message: "failed to export memos", Cause: err}
 	}
 	return nil
+}
+
+// parseMemoExportSince reads the since query parameter. The zero time means
+// the request asked for a full export.
+func parseMemoExportSince(r *http.Request) (time.Time, error) {
+	raw := r.URL.Query().Get("since")
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339, raw)
 }
 
 // admitMemoExport charges the caller's archive budget and takes the export
