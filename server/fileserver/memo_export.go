@@ -33,7 +33,8 @@ type MemoExporter interface {
 // with 429. HEAD runs every check and answers with the headers alone, so a
 // client can learn about a refusal before the browser starts a download. The
 // optional since query parameter, an RFC 3339 time such as the exportTime of
-// an earlier archive, limits the export to memos added or edited after it.
+// an earlier archive, includes memos added or edited in or after that second.
+// Successive archives overlap that second; consumers deduplicate by memo UID.
 func (s *FileServerService) serveMemoExport(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	if s.MemoExporter == nil {
@@ -62,13 +63,13 @@ func (s *FileServerService) serveMemoExport(w http.ResponseWriter, r *http.Reque
 		return &httphandler.Error{Code: http.StatusNotFound, Message: "user not found"}
 	}
 
-	preflight := r.Method == http.MethodHead
-	if err := s.admitMemoExport(w, caller, preflight); err != nil {
-		return err
-	}
 	since, err := parseMemoExportSince(r)
 	if err != nil {
 		return &httphandler.Error{Code: http.StatusBadRequest, Message: "invalid since parameter", Cause: err}
+	}
+	preflight := r.Method == http.MethodHead
+	if err := s.admitMemoExport(w, caller, preflight); err != nil {
+		return err
 	}
 	if !preflight {
 		defer s.memoExportSemaphore.Release(1)

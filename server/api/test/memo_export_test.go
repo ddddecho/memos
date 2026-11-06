@@ -227,20 +227,36 @@ func indexOfMemo(archive *memoexport.File, uid string) int {
 func TestWriteMemoExportSince(t *testing.T) {
 	ts := NewTestService(t)
 	defer ts.Cleanup()
-	fixture := buildArchiveFixture(t, ts, "incremental")
-
-	var buffer bytes.Buffer
+	ctx := context.Background()
+	user, err := ts.CreateRegularUser(ctx, "incremental")
+	require.NoError(t, err)
 	since := mustTime(t, "2026-03-01T00:00:00Z")
-	require.NoError(t, ts.Service.WriteMemoExport(context.Background(), fixture.user, &buffer, time.Now(), since))
-
-	file := readArchive(t, buffer.Bytes())
-	uids := make([]string, 0, len(file.Memos))
-	for _, memo := range file.Memos {
-		uids = append(uids, memo.UID)
+	cutoff := since.Unix()
+	for _, memo := range []*store.Memo{
+		{UID: "unchanged", CreatedTs: cutoff - 2, UpdatedTs: cutoff - 1},
+		{UID: "edited", CreatedTs: cutoff - 2, UpdatedTs: cutoff + 1},
+		{UID: "created", CreatedTs: cutoff + 1, UpdatedTs: cutoff + 1},
+		{UID: "created-at-cutoff", CreatedTs: cutoff, UpdatedTs: cutoff - 1},
+		{UID: "edited-at-cutoff", CreatedTs: cutoff - 2, UpdatedTs: cutoff},
+	} {
+		memo.CreatorID = user.ID
+		memo.Content = memo.UID
+		memo.Visibility = store.Private
+		_, err := ts.Store.CreateMemo(ctx, memo)
+		require.NoError(t, err)
 	}
-	require.Contains(t, uids, "parent00001")
-	require.NotContains(t, uids, "comment0001")
-	require.Equal(t, len(uids), file.Manifest.Counts.Memos)
+
+	for _, since := range []time.Time{since, since.Add(500 * time.Millisecond)} {
+		var buffer bytes.Buffer
+		require.NoError(t, ts.Service.WriteMemoExport(ctx, user, &buffer, time.Now(), since))
+		file := readArchive(t, buffer.Bytes())
+		uids := make([]string, 0, len(file.Memos))
+		for _, memo := range file.Memos {
+			uids = append(uids, memo.UID)
+		}
+		require.ElementsMatch(t, []string{"edited", "created", "created-at-cutoff", "edited-at-cutoff"}, uids)
+		require.Equal(t, 4, file.Manifest.Counts.Memos)
+	}
 }
 
 func TestImportMemoExportIntoAnotherAccount(t *testing.T) {

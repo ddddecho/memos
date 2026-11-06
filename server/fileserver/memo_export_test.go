@@ -230,6 +230,12 @@ func TestServeMemoExport_Since(t *testing.T) {
 	recorder = httptest.NewRecorder()
 	f.mux.ServeHTTP(recorder, invalid)
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
+
+	// An invalid cutoff must not retain the export lock or consume budget.
+	f.fs.MemoExporter = f.svc
+	require.Equal(t, http.StatusOK, f.request(ctx, t, http.MethodGet, f.member.Username, f.admin).Code)
+	require.Equal(t, ratelimit.DefaultPolicy()[ratelimit.ScopeArchiveUser].Limit-2,
+		f.fs.RateLimiter.Allowed(ratelimit.ScopeArchiveUser, fmt.Sprint(f.admin.ID), 1).Remaining)
 }
 
 func TestServeMemoExport_RouteDisabledWithoutExporter(t *testing.T) {

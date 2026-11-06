@@ -38,7 +38,8 @@ type memoExportData struct {
 // memo row the archive needs is loaded before the first byte is written, so a
 // failure loading them surfaces before the response is committed. Attachment
 // content is read while writing; a failure there truncates the archive. A
-// non-zero since limits the archive to memos added or edited after that time.
+// non-zero since includes memos added or edited in or after its Unix second.
+// Successive exports overlap that second; consumers deduplicate by memo UID.
 func (s *APIService) WriteMemoExport(ctx context.Context, user *store.User, w io.Writer, exportTime, since time.Time) error {
 	if user == nil {
 		return errors.New("user is required")
@@ -81,7 +82,9 @@ func (s *APIService) loadMemoExportData(ctx context.Context, user *store.User, s
 	}
 	if !since.IsZero() {
 		memos = slices.DeleteFunc(memos, func(memo *store.Memo) bool {
-			return memo.CreatedTs <= since.Unix()
+			// Stored timestamps have second precision. Include the cutoff second
+			// so changes after a previous export in that second are not lost.
+			return memo.CreatedTs < since.Unix() && memo.UpdatedTs < since.Unix()
 		})
 	}
 	export := &memoExportData{
