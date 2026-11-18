@@ -24,7 +24,7 @@ export function getDaysLeft(share: MemoShare, now = Date.now()): number {
 }
 
 export function isShareExpired(share: MemoShare, now = Date.now()): boolean {
-  return getDaysLeft(share, now) <= 0;
+  return getExpiryMs(share) <= now;
 }
 
 /** Soonest to expire first; links that never expire go last. */
