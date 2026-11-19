@@ -9,14 +9,18 @@ function getExpiryMs(share: MemoShare): number {
 
 /** The instant a link picked for the given date input value stops working: the end of that day. */
 export function getCustomExpireDate(value: string): Date {
-  const date = new Date(value);
-  date.setHours(23, 59, 59, 999);
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(year, month - 1, day, 23, 59, 59, 999);
   return date;
 }
 
 /** The earliest value the custom date input accepts, as yyyy-mm-dd. */
 export function getTodayInputValue(): string {
-  return new Date().toISOString().slice(0, 10);
+  const today = new Date();
+  const year = String(today.getFullYear()).padStart(4, "0");
+  const month = String(today.getMonth() + 1).padStart(2, "0");
+  const day = String(today.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 export function getDaysLeft(share: MemoShare, now = Date.now()): number {
