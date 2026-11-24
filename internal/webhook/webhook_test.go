@@ -5,14 +5,17 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -418,12 +421,12 @@ func TestPostRetriesTransientFailures(t *testing.T) {
 		name         string
 		statuses     []int
 		wantAttempts int32
-		wantErr      bool
+		wantErr      string
 	}{
 		{name: "recovers after a 503", statuses: []int{503, 200}, wantAttempts: 2},
 		{name: "recovers after a 429", statuses: []int{429, 200}, wantAttempts: 2},
-		{name: "gives up after the last attempt", statuses: []int{500, 502, 503, 200}, wantAttempts: 3, wantErr: true},
-		{name: "does not retry a client error", statuses: []int{404, 200}, wantAttempts: 1, wantErr: true},
+		{name: "returns the last status after exhausting attempts", statuses: []int{500, 502, 503, 200}, wantAttempts: 3, wantErr: "status code: 503"},
+		{name: "does not retry a client error", statuses: []int{404, 200}, wantAttempts: 1, wantErr: "status code: 404"},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -438,8 +441,8 @@ func TestPostRetriesTransientFailures(t *testing.T) {
 			defer server.Close()
 
 			err := Post(&Request{URL: server.URL, Payload: map[string]string{"hello": "world"}})
-			if tc.wantErr {
-				require.Error(t, err)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
 			} else {
 				require.NoError(t, err)
 			}
@@ -448,18 +451,154 @@ func TestPostRetriesTransientFailures(t *testing.T) {
 	}
 }
 
+type webhookRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f webhookRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	defer r.Body.Close()
+	return f(r)
+}
+
+func stubWebhookTransport(t *testing.T, f webhookRoundTripFunc) {
+	t.Helper()
+	previousClient := safeClient
+	safeClient = &http.Client{Transport: f}
+	t.Cleanup(func() { safeClient = previousClient })
+}
+
+func TestPostSignsEveryRetryWithCurrentTimestamp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			secret = "test-signing-secret"
+			target = "https://receiver.example/hook"
+		)
+		var attemptTimes []time.Time
+		ids := make(map[string]bool)
+		stubWebhookTransport(t, func(r *http.Request) (*http.Response, error) {
+			now := time.Now()
+			attemptTimes = append(attemptTimes, now)
+			require.Equal(t, http.MethodPost, r.Method)
+			require.Equal(t, target, r.URL.String())
+			require.Equal(t, "application/json", r.Header.Get("Content-Type"))
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			require.JSONEq(t, `{"hello":"world"}`, string(body))
+
+			id := r.Header.Get("webhook-id")
+			require.NotEmpty(t, id)
+			require.False(t, ids[id], "retry reused webhook ID %q", id)
+			ids[id] = true
+			timestamp := r.Header.Get("webhook-timestamp")
+			require.Equal(t, strconv.FormatInt(now.Unix(), 10), timestamp)
+			mac := hmac.New(sha256.New, []byte(secret))
+			mac.Write([]byte(id + "." + timestamp + "."))
+			mac.Write(body)
+			require.Equal(t, "v1,"+base64.StdEncoding.EncodeToString(mac.Sum(nil)), r.Header.Get("webhook-signature"))
+
+			switch len(attemptTimes) {
+			case 1:
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Header:     http.Header{"Retry-After": {"8"}},
+					Body:       io.NopCloser(strings.NewReader("rate limited")),
+				}, nil
+			case 2:
+				return nil, errors.New("connection reset")
+			default:
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"code":0}`))}, nil
+			}
+		})
+
+		require.NoError(t, Post(&Request{
+			URL: target, Payload: map[string]string{"hello": "world"}, SigningSecret: secret,
+		}))
+		require.Len(t, attemptTimes, 3)
+		require.GreaterOrEqual(t, attemptTimes[1].Sub(attemptTimes[0]), 8*time.Second)
+		require.Less(t, attemptTimes[1].Sub(attemptTimes[0]), 12*time.Second)
+		require.GreaterOrEqual(t, attemptTimes[2].Sub(attemptTimes[1]), 4*time.Second)
+		require.Less(t, attemptTimes[2].Sub(attemptTimes[1]), 6*time.Second)
+	})
+}
+
+func TestPostReturnsLastTransportErrorWithoutWaitingAgain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		failures := []error{
+			errors.New("first connection failure"),
+			errors.New("second connection failure"),
+			errors.New("third connection failure"),
+		}
+		var attempts int
+		var lastAttempt time.Time
+		stubWebhookTransport(t, func(_ *http.Request) (*http.Response, error) {
+			require.Less(t, attempts, len(failures), "delivery exceeded the retry limit")
+			err := failures[attempts]
+			attempts++
+			lastAttempt = time.Now()
+			return nil, err
+		})
+
+		err := Post(&Request{URL: "https://receiver.example/hook"})
+		require.ErrorIs(t, err, failures[2])
+		require.Equal(t, len(failures), attempts)
+		require.Zero(t, time.Since(lastAttempt), "delivery should return immediately after the final failure")
+	})
+}
+
+func TestPostStopsOnFinalResponseAfterRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		err    string
+	}{
+		{name: "client error", status: http.StatusBadRequest, body: "bad request", err: "status code: 400"},
+		{name: "application rejection", status: http.StatusOK, body: `{"code":7,"message":"rejected"}`, err: "code 7, msg: rejected"},
+		{name: "invalid JSON", status: http.StatusOK, body: "not JSON", err: "failed to unmarshal webhook response"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var attempts int
+				stubWebhookTransport(t, func(_ *http.Request) (*http.Response, error) {
+					attempts++
+					switch attempts {
+					case 1:
+						return &http.Response{
+							StatusCode: http.StatusServiceUnavailable,
+							Body:       io.NopCloser(strings.NewReader("try again")),
+						}, nil
+					case 2:
+						return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+					default:
+						t.Fatal("delivery retried a final response")
+						return nil, nil
+					}
+				})
+
+				err := Post(&Request{URL: "https://receiver.example/hook"})
+				require.ErrorContains(t, err, tc.err)
+				require.Equal(t, 2, attempts)
+			})
+		})
+	}
+}
+
 func TestRetryDelay(t *testing.T) {
-	first := retryDelay(0, "")
-	require.GreaterOrEqual(t, first, retryBaseDelay)
-	require.Less(t, first, retryBaseDelay+retryBaseDelay/2)
-
-	second := retryDelay(1, "")
-	require.GreaterOrEqual(t, second, 2*retryBaseDelay)
-
-	honored := retryDelay(0, "10")
-	require.GreaterOrEqual(t, honored, 10*time.Second)
-	require.Less(t, honored, 15*time.Second)
-
-	unparsable := retryDelay(0, "Wed, 21 Oct 2026 07:28:00 GMT")
-	require.Less(t, unparsable, 2*retryBaseDelay)
+	for _, tc := range []struct {
+		name       string
+		attempt    int
+		retryAfter string
+		wantBase   time.Duration
+	}{
+		{name: "first retry", wantBase: 2 * time.Second},
+		{name: "second retry doubles the backoff", attempt: 1, wantBase: 4 * time.Second},
+		{name: "whole seconds override the backoff", attempt: 1, retryAfter: "1", wantBase: time.Second},
+		{name: "HTTP date falls back to exponential backoff", attempt: 1, retryAfter: "Wed, 21 Oct 2026 07:28:00 GMT", wantBase: 4 * time.Second},
+		{name: "negative seconds fall back to exponential backoff", attempt: 1, retryAfter: "-1", wantBase: 4 * time.Second},
+		{name: "fractional seconds fall back to exponential backoff", attempt: 1, retryAfter: "0.5", wantBase: 4 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			delay := retryDelay(tc.attempt, tc.retryAfter)
+			require.GreaterOrEqual(t, delay, tc.wantBase)
+			require.Less(t, delay, tc.wantBase+tc.wantBase/2)
+		})
+	}
 }
