@@ -54,8 +54,31 @@ func (s *Store) ListMemoShares(ctx context.Context, find *FindMemoShare) ([]*Mem
 }
 
 // GetMemoShare returns the first share grant matching the filter, or nil if none found.
+// Lookups by token are cached: every asset on a public share page resolves the
+// same token, so one page view would otherwise cost a query per attachment.
 func (s *Store) GetMemoShare(ctx context.Context, find *FindMemoShare) (*MemoShare, error) {
-	return s.driver.GetMemoShare(ctx, find)
+	if find.UID != nil {
+		if cached, ok := s.memoShareCache.Get(ctx, *find.UID); ok {
+			if ms, ok := cached.(*MemoShare); ok {
+				return ms, nil
+			}
+		}
+	}
+	ms, err := s.driver.GetMemoShare(ctx, find)
+	if err != nil {
+		return nil, err
+	}
+	if ms != nil {
+		s.memoShareCache.Set(ctx, ms.UID, ms)
+	}
+	return ms, nil
+}
+
+// DeleteExpiredMemoShares removes every share grant that expired before the
+// given unix timestamp and returns how many were removed. Grants without an
+// expiry are kept.
+func (s *Store) DeleteExpiredMemoShares(ctx context.Context, before int64) (int64, error) {
+	return s.driver.DeleteExpiredMemoShares(ctx, before)
 }
 
 // DeleteMemoShare removes a share grant.
@@ -69,11 +92,11 @@ func (s *Store) DeleteMemoShare(ctx context.Context, delete *DeleteMemoShare) er
 	if err := validateMemoWritePolicy(delete.Policy); err != nil {
 		return err
 	}
-	if delete.Policy == nil {
-		return s.driver.DeleteMemoShare(ctx, delete)
-	}
-	if delete.MemoID == nil || *delete.MemoID <= 0 {
+	if delete.Policy != nil && (delete.MemoID == nil || *delete.MemoID <= 0) {
 		return errors.New("authorized memo share deletion requires memo")
+	}
+	if delete.UID != nil {
+		s.memoShareCache.Delete(ctx, *delete.UID)
 	}
 	return s.driver.DeleteMemoShare(ctx, delete)
 }

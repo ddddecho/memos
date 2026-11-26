@@ -194,3 +194,11 @@ func postgresMemoShareDeleteWhere(delete *store.DeleteMemoShare) ([]string, []an
 	}
 	return where, args
 }
+
+func (d *DB) DeleteExpiredMemoShares(ctx context.Context, before int64) (int64, error) {
+	result, err := d.db.ExecContext(ctx, "DELETE FROM memo_share WHERE COALESCE(expires_ts, 0) < $1", before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}

@@ -41,6 +41,9 @@ const (
 // healthzDatabaseTimeout bounds the database ping behind /healthz.
 const healthzDatabaseTimeout = 2 * time.Second
 
+// memoSharePurgeInterval is how often expired share links are removed.
+const memoSharePurgeInterval = time.Hour
+
 type Server struct {
 	Secret  string
 	Profile *profile.Profile
@@ -165,7 +168,7 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// startBackgroundJobs runs one-off data jobs that must not delay serving.
+// startBackgroundJobs runs data jobs that must not delay serving.
 func (s *Server) startBackgroundJobs() {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.backgroundCancel = cancel
@@ -175,6 +178,34 @@ func (s *Server) startBackgroundJobs() {
 			slog.Error("failed to rebuild memo payloads; retrying on next start", slog.String("error", err.Error()))
 		}
 	})
+	s.backgroundJobs.Go(func() {
+		s.purgeExpiredMemoShares(ctx)
+	})
+}
+
+// purgeExpiredMemoShares removes expired share links on a fixed interval until
+// ctx is canceled. Expired links are already refused on read; this only keeps
+// the table from growing without bound.
+func (s *Server) purgeExpiredMemoShares(ctx context.Context) {
+	ticker := time.NewTicker(memoSharePurgeInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			purged, err := s.Store.DeleteExpiredMemoShares(ctx, time.Now().Unix())
+			if err != nil {
+				if ctx.Err() == nil {
+					slog.Error("failed to purge expired memo shares", slog.String("error", err.Error()))
+				}
+				return
+			}
+			if purged > 0 {
+				slog.Info("purged expired memo shares", slog.Int64("count", purged))
+			}
+		}
+	}
 }
 
 func (s *Server) stopBackgroundJobs() {

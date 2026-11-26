@@ -195,3 +195,62 @@ func TestMemoShareFiltersAndExpiryRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, shares, list)
 }
+
+func TestMemoShareLookupByTokenIsInvalidatedOnDelete(t *testing.T) {
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+	defer ts.Close()
+
+	owner, err := createTestingHostUser(ctx, ts)
+	require.NoError(t, err)
+	memo, err := ts.CreateMemo(ctx, &store.Memo{
+		UID: "memo-share-cache", CreatorID: owner.ID, Content: "memo", Visibility: store.Public,
+	})
+	require.NoError(t, err)
+	created, err := ts.CreateMemoShare(ctx, &store.MemoShare{UID: "memo-share-cache-token", MemoID: memo.ID, CreatorID: owner.ID})
+	require.NoError(t, err)
+
+	for range 2 {
+		found, err := ts.GetMemoShare(ctx, &store.FindMemoShare{UID: &created.UID})
+		require.NoError(t, err)
+		require.NotNil(t, found)
+		require.Equal(t, created.ID, found.ID)
+	}
+
+	require.NoError(t, ts.DeleteMemoShare(ctx, &store.DeleteMemoShare{UID: &created.UID}))
+	found, err := ts.GetMemoShare(ctx, &store.FindMemoShare{UID: &created.UID})
+	require.NoError(t, err)
+	require.Nil(t, found)
+}
+
+func TestDeleteExpiredMemoShares(t *testing.T) {
+	ctx := context.Background()
+	ts := NewTestingStore(ctx, t)
+	defer ts.Close()
+
+	owner, err := createTestingHostUser(ctx, ts)
+	require.NoError(t, err)
+	memo, err := ts.CreateMemo(ctx, &store.Memo{
+		UID: "memo-share-purge", CreatorID: owner.ID, Content: "memo", Visibility: store.Public,
+	})
+	require.NoError(t, err)
+
+	now := time.Now().Unix()
+	past, future := now-60, now+3600
+	for uid, expiresTs := range map[string]*int64{
+		"memo-share-purge-expired": &past,
+		"memo-share-purge-active":  &future,
+	} {
+		_, err := ts.CreateMemoShare(ctx, &store.MemoShare{UID: uid, MemoID: memo.ID, CreatorID: owner.ID, ExpiresTs: expiresTs})
+		require.NoError(t, err)
+	}
+
+	purged, err := ts.DeleteExpiredMemoShares(ctx, now)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, purged)
+
+	shares, err := ts.ListMemoShares(ctx, &store.FindMemoShare{MemoID: &memo.ID})
+	require.NoError(t, err)
+	require.Len(t, shares, 1)
+	require.Equal(t, "memo-share-purge-active", shares[0].UID)
+}
