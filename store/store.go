@@ -77,4 +77,3 @@ func (s *Store) Close() error {
 
 	return s.driver.Close()
 }
-// viewed-progress research: temporary line, reverted right after
